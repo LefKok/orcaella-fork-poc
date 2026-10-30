@@ -147,6 +147,13 @@ impl Block {
         self
     }
 
+    /// Override the includes of a test block (the parent references).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_includes(mut self, includes: Vec<BlockReference>) -> Self {
+        self.includes = includes;
+        self
+    }
+
     /// Verify the integrity and validity of a block received from the network.
     pub fn verify(
         &self,

@@ -7,12 +7,13 @@ mod dispatcher;
 mod equivocator;
 pub mod event_simulator;
 pub mod executor;
+mod fork_attack;
 pub mod latency;
 pub mod network;
 pub mod runner;
 pub mod tracing;
 
-pub use config::{NetworkTopology, SimulationConfig, SimulationMode};
+pub use config::{ForkAttack, NetworkTopology, SimulationConfig, SimulationMode};
 pub use context::{SimulatorContext, SimulatorInstant};
 pub use event_simulator::{Scheduler, Simulator, SimulatorState};
 pub use executor::{JoinError, JoinHandle, SimulatorExecutor, Sleep};

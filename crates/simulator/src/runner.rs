@@ -78,6 +78,9 @@ impl SimulationRunner {
             .latency
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        config
+            .validate_fork_attack()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         SimulatorExecutor::run(rng, async move {
             let state = SimulationState::setup(config).await;
             state.apply_topology().await;
@@ -207,7 +210,12 @@ impl SimulationState {
                 protocol.leader_count.get(),
                 protocol.leader_election,
             )
+            .with_fork_attack(config.fork_attack.as_ref(), protocol.leader_election)
             .with_jitter(config.jitter);
+
+        if let Some(r) = network.fork_attack_round() {
+            tracing::info!("Fork attack configured: attack round R = {}", r);
+        }
 
         Self {
             config,

@@ -3,9 +3,10 @@
 
 use std::path::PathBuf;
 
+use dag::committee::Committee;
 use dag::config::ImportExport;
 use eyre::{Result, bail};
-use replica::result::Outcome;
+use replica::result::{Outcome, ResilientOutcome};
 use simulator::{SimulationConfig, SimulationMode, SimulationRunner, SimulatorTracing};
 use tracing_subscriber::filter::LevelFilter;
 
@@ -89,6 +90,38 @@ pub async fn simulate(
 
         terminal.print_results(&result.config, &result);
 
+        // Compute resilient outcome when fork_attack is configured.
+        let resilient = result.config.fork_attack.as_ref().map(|attack| {
+            let committee = Committee::new_test(vec![1; result.config.committee_size]);
+            let quorum = result
+                .config
+                .replica_parameters
+                .consensus
+                .to_protocol(&committee)
+                .expect("valid protocol")
+                .quorum_threshold as usize;
+            let equivocators: Vec<usize> = attack.equivocator_indices(result.config.committee_size).collect();
+            let outcome = ResilientOutcome::compute(
+                result.storages.iter().map(|s| s.iter_commits()),
+                quorum,
+                &equivocators,
+            );
+            terminal.print_details(
+                "Resilient Path",
+                &[
+                    ("heights", &outcome.heights.to_string()),
+                    (
+                        "first_fork_height",
+                        &outcome
+                            .first_fork_height
+                            .map_or("none".into(), |h| h.to_string()),
+                    ),
+                    ("forked_heights", &outcome.forked_heights.to_string()),
+                ],
+            );
+            outcome
+        });
+
         if result.outcome == Outcome::Diverged {
             diverged += 1;
         }
@@ -96,7 +129,7 @@ pub async fn simulate(
             if export_dag {
                 exporter.write_commit_log(&result.storages, index + 1, total, name.as_deref())?;
             }
-            exporter.write_run_result(&result, index + 1, total, name.as_deref())?;
+            exporter.write_run_result(&result, resilient, index + 1, total, name.as_deref())?;
         }
     }
 

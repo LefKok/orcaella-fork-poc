@@ -10,9 +10,11 @@ use std::{
 
 use tokio::{select, sync::mpsc};
 
+use super::config::ForkAttack;
 use super::context::SimulatorContext;
 use super::equivocator::Equivocator;
 use super::executor::Sleep;
+use super::fork_attack::{ForkAttacker, fork_attack_outbound};
 use super::latency::{ExponentialJitter, LatencyModel, LinkLatency};
 use consensus::leader::LeaderElection;
 use dag::committee::Committee;
@@ -27,6 +29,7 @@ pub struct SimulatedNetwork {
     latency: LatencyModel,
     jitter: Option<ExponentialJitter>,
     equivocators: HashMap<usize, Arc<Equivocator>>,
+    fork_attacker: Option<Arc<ForkAttacker>>,
 }
 
 impl SimulatedNetwork {
@@ -46,6 +49,7 @@ impl SimulatedNetwork {
                 latency,
                 jitter: None,
                 equivocators: HashMap::new(),
+                fork_attacker: None,
             },
             networks,
         )
@@ -76,6 +80,22 @@ impl SimulatedNetwork {
     pub fn with_jitter(mut self, jitter: Option<ExponentialJitter>) -> Self {
         self.jitter = jitter;
         self
+    }
+
+    /// Configure a fork attack (see docs/fork-attack-poc.md).
+    pub fn with_fork_attack(
+        mut self,
+        config: Option<&ForkAttack>,
+        leader_election: LeaderElection,
+    ) -> Self {
+        self.fork_attacker =
+            config.map(|c| Arc::new(ForkAttacker::new(c, self.senders.len(), leader_election)));
+        self
+    }
+
+    /// The computed attack round R, if a fork attack is configured.
+    pub fn fork_attack_round(&self) -> Option<u64> {
+        self.fork_attacker.as_ref().map(|a| a.attack_round())
     }
 
     pub async fn connect_all(&self) {
@@ -118,7 +138,8 @@ impl SimulatedNetwork {
         b.send(b_connection).await.ok();
     }
 
-    /// The `from -> to` link, routed through the equivocation shim when `from` equivocates.
+    /// The `from -> to` link, routed through the equivocation shim when `from` equivocates,
+    /// or through the fork attack shim when a fork attack is configured.
     /// `inbound` is the `to -> from` direction of the same link, through which the shim
     /// reflects every twin back to `from` as if a peer had sent it (best effort).
     fn outbound(
@@ -128,6 +149,12 @@ impl SimulatedNetwork {
         sender: mpsc::Sender<NetworkMessage>,
         inbound: mpsc::Sender<NetworkMessage>,
     ) -> mpsc::Sender<NetworkMessage> {
+        // Fork attack shim takes precedence (mutually exclusive with equivocating_leaders)
+        if let Some(ref attacker) = self.fork_attacker {
+            return fork_attack_outbound(attacker.clone(), from, to, sender, inbound);
+        }
+
+        // Original equivocator shim
         let Some(equivocator) = self.equivocators.get(&from).cloned() else {
             return sender;
         };

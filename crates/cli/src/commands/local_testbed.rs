@@ -176,7 +176,7 @@ pub async fn local_testbed(
         if export_dag {
             exporter.write_commit_log(&result.storages, 1, 1, None)?;
         }
-        exporter.write_run_result(&result, 1, 1, None)?;
+        exporter.write_run_result(&result, None, 1, 1, None)?;
     }
     if result.outcome == Outcome::Diverged {
         bail!("local testbed run diverged");

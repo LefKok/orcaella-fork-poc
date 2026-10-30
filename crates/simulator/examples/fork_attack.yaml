@@ -1,0 +1,37 @@
+# Fork attack scenario (see docs/fork-attack-poc.md).
+#
+# Committee: n=14, f=2, c=1 => q=11 (n-f-c), k=6 (n-3f-2c)
+# Partition (see the index layout in the spec):
+#   L  = 0          (equivocating leader of slot R)
+#   A' = 1..6       (5 honest, support twin A)
+#   B  = 6..9       (3 honest, support twin B, = f+c)
+#   D  = 9..12      (3 hidden, = f+c)
+#   E  = {0,12,13}  (3 equivocators)
+#
+# At e=3 (= f+1), the attack should diverge:
+# - D direct-commits twin A (sees q=11 supports: A' + D + E's A-versions)
+# - Others indirect-commit twin B via the R+2 anchor (E's native votes + B = 6 >= k=6)
+#
+# Run:
+#   cargo run --release -- simulate --config-path crates/simulator/examples/fork_attack.yaml --output-dir /tmp/fork-out
+name: fork-attack-e3
+committee_size: 14
+duration_secs: 30
+rng_seed: 0
+topology: fullMesh
+replica_parameters:
+  consensus:
+    protocol: orcaella
+    leader_count: 2
+    f: 2
+    c: 1
+fork_attack:
+  equivocators: 3
+  hidden: 3
+  b_side: 3
+  attack_start_round: 10
+  hide_delay_ms: 5000
+load_generator:
+  load: 100
+  transaction_size: 512
+  initial_delay: 0s

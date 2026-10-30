@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fmt, num::NonZeroU64, time::Duration};
+use std::{fmt, num::NonZeroU64, ops::Range, time::Duration};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -71,6 +71,9 @@ pub struct SimulationConfig {
     /// Authority indices that send twin blocks in their leader rounds (see docs/simulator.md).
     #[serde(default)]
     pub equivocating_leaders: Vec<usize>,
+    /// Fork attack configuration (see docs/fork-attack-poc.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_attack: Option<ForkAttack>,
     /// Snapshot every replica's metrics this often during the run (see docs/simulator.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_interval_secs: Option<NonZeroU64>,
@@ -89,6 +92,7 @@ impl Default for SimulationConfig {
             replica_parameters: ReplicaParameters::default(),
             load_generator: Some(LoadGeneratorConfig::new_for_test()),
             equivocating_leaders: Vec::new(),
+            fork_attack: None,
             sample_interval_secs: None,
         }
     }
@@ -150,5 +154,99 @@ mod defaults {
     }
     pub fn load_generator() -> Option<LoadGeneratorConfig> {
         Some(LoadGeneratorConfig::new_for_test())
+    }
+}
+
+/// Fork attack configuration (see docs/fork-attack-poc.md).
+///
+/// Index layout: `L = 0`, then `A'`, `B`, `D`, and the remaining equivocators last, so the
+/// round-robin leaders right after the attack round are honest `A'` members.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ForkAttack {
+    /// Number of equivocators (L = 0 plus the last `equivocators - 1` indices).
+    pub equivocators: usize,
+    /// Number of hidden replicas (D).
+    pub hidden: usize,
+    /// Number of B-side replicas (B).
+    pub b_side: usize,
+    /// Smallest leader round to start the attack.
+    #[serde(default = "fork_attack_defaults::attack_start_round")]
+    pub attack_start_round: u64,
+    /// Delay (ms) for messages from D to non-D peers.
+    #[serde(default = "fork_attack_defaults::hide_delay_ms")]
+    pub hide_delay_ms: u64,
+}
+
+mod fork_attack_defaults {
+    pub fn attack_start_round() -> u64 {
+        10
+    }
+    pub fn hide_delay_ms() -> u64 {
+        5000
+    }
+}
+
+impl ForkAttack {
+    /// Validate the fork attack configuration against the committee size.
+    pub fn validate(&self, n: usize) -> Result<(), ForkAttackError> {
+        if self.equivocators < 1 {
+            return Err(ForkAttackError::NoEquivocators);
+        }
+        let total = self.equivocators + self.hidden + self.b_side;
+        if total > n {
+            return Err(ForkAttackError::SetsTooLarge { total, n });
+        }
+        Ok(())
+    }
+
+    /// Equivocator indices: L = 0 and the last `equivocators - 1` indices.
+    pub fn equivocator_indices(&self, n: usize) -> impl Iterator<Item = usize> {
+        std::iter::once(0).chain(n + 1 - self.equivocators..n)
+    }
+
+    /// Hidden (D) indices: just before the trailing equivocators.
+    pub fn hidden_indices(&self, n: usize) -> Range<usize> {
+        let end = n + 1 - self.equivocators;
+        end - self.hidden..end
+    }
+
+    /// B-side indices: just before D.
+    pub fn b_side_indices(&self, n: usize) -> Range<usize> {
+        let end = self.hidden_indices(n).start;
+        end - self.b_side..end
+    }
+
+    /// A' indices: everything between L and B (may be empty at the break point).
+    pub fn a_prime_indices(&self, n: usize) -> Range<usize> {
+        1..self.b_side_indices(n).start
+    }
+
+    /// Hide delay as a Duration.
+    pub fn hide_delay(&self) -> Duration {
+        Duration::from_millis(self.hide_delay_ms)
+    }
+}
+
+/// Errors from fork attack validation.
+#[derive(Debug, thiserror::Error)]
+pub enum ForkAttackError {
+    #[error("fork_attack requires at least 1 equivocator")]
+    NoEquivocators,
+    #[error("fork_attack sets total {total} exceeds committee size {n}")]
+    SetsTooLarge { total: usize, n: usize },
+    #[error("fork_attack is mutually exclusive with equivocating_leaders")]
+    MutuallyExclusiveWithEquivocatingLeaders,
+}
+
+impl SimulationConfig {
+    /// Validate the fork attack configuration against the simulation.
+    pub fn validate_fork_attack(&self) -> Result<(), ForkAttackError> {
+        if let Some(ref fork_attack) = self.fork_attack {
+            if !self.equivocating_leaders.is_empty() {
+                return Err(ForkAttackError::MutuallyExclusiveWithEquivocatingLeaders);
+            }
+            fork_attack.validate(self.committee_size)?;
+        }
+        Ok(())
     }
 }

@@ -169,6 +169,17 @@ non-pipelined Cordial Miners variants equivocate in a few extra (non-leader) rou
 harmless. And equivocating in every round is not offered: the leader rounds are where
 equivocation bears on the commit rule.
 
+### Fork Attack
+
+The `fork_attack` field configures a more sophisticated equivocation scenario that demonstrates
+the tightness of Orcaella's exclusivity bound. See [docs/fork-attack-poc.md](fork-attack-poc.md)
+for the full specification. The attack partitions the committee into equivocators (E), hidden
+honest replicas (D), A-side supporters (A'), and B-side supporters (B), then selectively
+delivers twin blocks and rewrites vote references to cause D to direct-commit one twin while
+others indirect-commit the other.
+
+The `fork_attack` and `equivocating_leaders` fields are mutually exclusive.
+
 ## Outcomes
 
 Every run ends with one of three verdicts, classified by comparing the committed-leader sequences of

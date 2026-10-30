@@ -109,6 +109,101 @@ where
     }
 }
 
+/// Emulated Resilient Path outcome: certificate counting from per-replica committed streams.
+///
+/// The cumulative `PrefixHasher` hash after `h` commits is replica `i`'s state root at
+/// height `h`. Honest replicas attest their own roots; equivocators (AbC behaviour) attest
+/// every distinct root observed at each height. A checkpoint certificate exists for
+/// `(h, root)` iff the number of attesting authorities is `≥ quorum`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResilientOutcome {
+    /// Maximum height reached by any replica.
+    pub heights: usize,
+    /// Smallest height with two or more certified roots, if any.
+    pub first_fork_height: Option<usize>,
+    /// Number of heights with two or more certified roots.
+    pub forked_heights: usize,
+}
+
+impl ResilientOutcome {
+    /// Compute the resilient outcome from per-replica committed streams.
+    ///
+    /// - `streams`: per-replica iterators of `CommitData`, replica index = position.
+    /// - `quorum`: minimum attestations required for a certificate.
+    /// - `equivocators`: indices of replicas that attest all observed roots at each height.
+    pub fn compute<I, R>(streams: I, quorum: usize, equivocators: &[usize]) -> Self
+    where
+        I: IntoIterator<Item = R>,
+        R: IntoIterator<Item = CommitData>,
+    {
+        use std::collections::{HashMap, HashSet};
+
+        // Collect all (height -> root) pairs per replica.
+        let mut replica_roots: Vec<Vec<[u8; 32]>> = Vec::new();
+        for stream in streams {
+            let mut hasher = PrefixHasher::new();
+            let mut roots = Vec::new();
+            for commit in stream {
+                commit.crypto_hash(&mut hasher);
+                roots.push(hasher.clone().finalize().into());
+            }
+            replica_roots.push(roots);
+        }
+
+        let max_height = replica_roots.iter().map(|r| r.len()).max().unwrap_or(0);
+        if max_height == 0 {
+            return Self {
+                heights: 0,
+                first_fork_height: None,
+                forked_heights: 0,
+            };
+        }
+
+        let equivocator_set: HashSet<usize> = equivocators.iter().copied().collect();
+        let mut forked_heights = 0;
+        let mut first_fork_height = None;
+
+        for h in 0..max_height {
+            // Collect all distinct roots at this height.
+            let mut roots_at_h: HashSet<[u8; 32]> = HashSet::new();
+            for roots in &replica_roots {
+                if let Some(root) = roots.get(h) {
+                    roots_at_h.insert(*root);
+                }
+            }
+
+            // Count attestations per root.
+            let mut attestations: HashMap<[u8; 32], usize> = HashMap::new();
+            for (i, roots) in replica_roots.iter().enumerate() {
+                if equivocator_set.contains(&i) {
+                    // Equivocator attests all distinct roots at this height.
+                    for root in &roots_at_h {
+                        *attestations.entry(*root).or_default() += 1;
+                    }
+                } else if let Some(root) = roots.get(h) {
+                    // Honest replica attests its own root.
+                    *attestations.entry(*root).or_default() += 1;
+                }
+            }
+
+            // Count certified roots (attestations >= quorum).
+            let certified_count = attestations.values().filter(|&&c| c >= quorum).count();
+            if certified_count >= 2 {
+                forked_heights += 1;
+                if first_fork_height.is_none() {
+                    first_fork_height = Some(h + 1); // 1-indexed height
+                }
+            }
+        }
+
+        Self {
+            heights: max_height,
+            first_fork_height,
+            forked_heights,
+        }
+    }
+}
+
 /// Every replica's metrics at one point of a run.
 pub struct MetricsSample {
     /// Time since the start of the run.
@@ -301,5 +396,67 @@ mod tests {
         );
 
         assert_eq!(result.outcome, Outcome::NoProgress);
+    }
+
+    // --- ResilientOutcome tests ---
+
+    use super::ResilientOutcome;
+
+    #[test]
+    fn resilient_all_agree_no_fork() {
+        // All 4 replicas see the same sequence -> no forked heights.
+        let seq = CommitData::new_for_test(&[(0, 1), (1, 2), (2, 3)]);
+        let streams = vec![seq.clone(), seq.clone(), seq.clone(), seq];
+        let outcome = ResilientOutcome::compute(streams, 3, &[]);
+        assert_eq!(outcome.heights, 3);
+        assert_eq!(outcome.first_fork_height, None);
+        assert_eq!(outcome.forked_heights, 0);
+    }
+
+    #[test]
+    fn resilient_diverge_but_one_side_lacks_quorum() {
+        // 6 replicas, quorum = 4. Groups A (replicas 0-2) and B (replicas 3-5) diverge at
+        // height 3. With no equivocators, each side has 3 attestations (< 4), so neither
+        // root is certified. With 1 equivocator (index 0), A-side has 2+1=3 honest + 1 equivocator
+        // attestation for A, and 1 for B; still only one side reaches quorum at most.
+        let a = CommitData::new_for_test(&[(0, 1), (1, 2), (0, 3)]); // differs at height 3
+        let b = CommitData::new_for_test(&[(0, 1), (1, 2), (1, 3)]);
+        let streams = vec![
+            a.clone(),
+            a.clone(),
+            a.clone(),
+            b.clone(),
+            b.clone(),
+            b.clone(),
+        ];
+        // quorum=4, equivocators=[0]: A-side gets 2 honest + 1 equivocator = 3 votes,
+        // B-side gets 3 honest + 1 equivocator = 4 votes. Only B certified.
+        let outcome = ResilientOutcome::compute(streams, 4, &[0]);
+        assert_eq!(outcome.heights, 3);
+        assert_eq!(outcome.first_fork_height, None);
+        assert_eq!(outcome.forked_heights, 0);
+    }
+
+    #[test]
+    fn resilient_diverge_both_sides_reach_quorum() {
+        // 6 replicas, quorum = 3. Groups A (0-2) and B (3-5) diverge at height 3.
+        // With 2 equivocators (indices 0, 3), each root gets:
+        // - A: 2 honest (1,2) + 2 equivocators (0,3) = 4 >= 3 ✓
+        // - B: 2 honest (4,5) + 2 equivocators (0,3) = 4 >= 3 ✓
+        // Both certified -> fork at height 3.
+        let a = CommitData::new_for_test(&[(0, 1), (1, 2), (0, 3)]);
+        let b = CommitData::new_for_test(&[(0, 1), (1, 2), (1, 3)]);
+        let streams = vec![
+            a.clone(),
+            a.clone(),
+            a.clone(),
+            b.clone(),
+            b.clone(),
+            b.clone(),
+        ];
+        let outcome = ResilientOutcome::compute(streams, 3, &[0, 3]);
+        assert_eq!(outcome.heights, 3);
+        assert_eq!(outcome.first_fork_height, Some(3)); // 1-indexed
+        assert_eq!(outcome.forked_heights, 1);
     }
 }

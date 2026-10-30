@@ -43,7 +43,7 @@ use dag::{
     storage::{CommitData, Storage},
 };
 use eyre::{Result, WrapErr};
-use replica::result::{Outcome, RunKind, RunResult};
+use replica::result::{Outcome, ResilientOutcome, RunKind, RunResult};
 use serde::Serialize;
 use tempfile::NamedTempFile;
 
@@ -58,6 +58,8 @@ const TRACING_LOG_FILE: &str = "tracing.log";
 #[derive(Serialize)]
 struct Meta {
     outcome: Outcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resilient: Option<ResilientOutcome>,
     duration_secs: u64,
     kind: RunKind,
     /// Unix epoch seconds at the time of export. Downstream consumers render as RFC3339
@@ -141,6 +143,7 @@ impl Exporter {
     pub fn write_run_result<C: Serialize>(
         &self,
         result: &RunResult<C>,
+        resilient: Option<ResilientOutcome>,
         index: usize,
         total: usize,
         name: Option<&str>,
@@ -154,6 +157,7 @@ impl Exporter {
 
         let meta = Meta {
             outcome: result.outcome,
+            resilient,
             duration_secs: result.duration.as_secs(),
             kind: result.kind,
             timestamp_unix: SystemTime::now()
