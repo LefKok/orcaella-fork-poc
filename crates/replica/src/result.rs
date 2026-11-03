@@ -204,6 +204,68 @@ impl ResilientOutcome {
     }
 }
 
+/// A replica's state root at each height: the cumulative [`PrefixHasher`] hash after `h`
+/// commits (1-indexed heights, `roots[h-1]`). The same emulation as [`ResilientOutcome`].
+pub fn state_roots<I: IntoIterator<Item = CommitData>>(stream: I) -> Vec<[u8; 32]> {
+    let mut hasher = PrefixHasher::new();
+    stream
+        .into_iter()
+        .map(|commit| {
+            commit.crypto_hash(&mut hasher);
+            hasher.clone().finalize().into()
+        })
+        .collect()
+}
+
+/// Outcome of the simulated fork recovery (paper, Algorithm 2) run by the simulator after the
+/// fork attack: Alarm, 2Δ_sync wait, Dolev-Strong exchange, exposure, counting, GenesisQC.
+/// Times are simulated milliseconds since the start of the run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Default)]
+pub struct RecoveryReport {
+    pub delta_sync_ms: u64,
+    /// Dolev-Strong rounds, `t + 1 = n - 2f - c`.
+    pub rounds: usize,
+    /// Correct replicas (neither Byzantine nor crashed).
+    pub correct: usize,
+    /// First fork detection by a correct replica.
+    pub detection_ms: Option<u64>,
+    /// Timestamp of the earliest valid Alarm, to which the lockstep rounds are anchored.
+    pub alarm_ms: Option<u64>,
+    /// Start and end of the Dolev-Strong exchange.
+    pub exchange_start_ms: Option<u64>,
+    pub exchange_end_ms: Option<u64>,
+    /// Earliest and latest time a correct replica holds a GenesisQC.
+    pub genesis_first_ms: Option<u64>,
+    pub genesis_last_ms: Option<u64>,
+    /// Alarm to the last correct GenesisQC.
+    pub recovery_ms: Option<u64>,
+    /// Height (1-indexed) of the attacked slot in the commit sequences.
+    pub fork_height: Option<usize>,
+    /// Highest height with a delivered CheckpointQC (`C_max`); 0 for none.
+    pub c_max: usize,
+    /// Exposed replicas `|E|`, and whether every exposed replica is Byzantine.
+    pub exposed: usize,
+    pub exposed_only_byzantine: bool,
+    /// ChkProp counts at the fork height from non-exposed replicas: the root the client
+    /// finalized versus the best conflicting root.
+    pub count_finalized: usize,
+    pub count_conflicting: usize,
+    /// Whether the canonical branch carries the client-finalized root at the fork height.
+    pub finalized_recovered: Option<bool>,
+    /// Height at which the counting step stopped, if it did.
+    pub break_height: Option<usize>,
+    /// Whether all correct replicas computed the same canonical branch.
+    pub agreement: bool,
+    /// Last height of the canonical branch.
+    pub canonical_height: usize,
+    /// Bytes of one replica's broadcast input (max over correct replicas).
+    pub input_bytes_max: u64,
+    /// Bytes sent by one replica over the whole recovery (max over correct replicas).
+    pub sent_bytes_max: u64,
+    pub sent_bytes_total: u64,
+    pub messages_total: u64,
+}
+
 /// Every replica's metrics at one point of a run.
 pub struct MetricsSample {
     /// Time since the start of the run.
@@ -228,6 +290,8 @@ pub struct RunResult<C> {
     pub storages: Vec<Storage>,
     /// In-run metrics snapshots, oldest first; empty unless the runner samples.
     pub samples: Vec<MetricsSample>,
+    /// Simulated fork recovery, when the runner ran one.
+    pub recovery: Option<RecoveryReport>,
 }
 
 impl<C> RunResult<C> {
@@ -249,11 +313,17 @@ impl<C> RunResult<C> {
             kind,
             storages,
             samples: Vec::new(),
+            recovery: None,
         }
     }
 
     pub fn with_samples(mut self, samples: Vec<MetricsSample>) -> Self {
         self.samples = samples;
+        self
+    }
+
+    pub fn with_recovery(mut self, recovery: Option<RecoveryReport>) -> Self {
+        self.recovery = recovery;
         self
     }
 }

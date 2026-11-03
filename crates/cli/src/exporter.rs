@@ -43,7 +43,7 @@ use dag::{
     storage::{CommitData, Storage},
 };
 use eyre::{Result, WrapErr};
-use replica::result::{Outcome, ResilientOutcome, RunKind, RunResult};
+use replica::result::{Outcome, RecoveryReport, ResilientOutcome, RunKind, RunResult};
 use serde::Serialize;
 use tempfile::NamedTempFile;
 
@@ -60,6 +60,8 @@ struct Meta {
     outcome: Outcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     resilient: Option<ResilientOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<RecoveryReport>,
     duration_secs: u64,
     kind: RunKind,
     /// Unix epoch seconds at the time of export. Downstream consumers render as RFC3339
@@ -158,6 +160,7 @@ impl Exporter {
         let meta = Meta {
             outcome: result.outcome,
             resilient,
+            recovery: result.recovery.clone(),
             duration_secs: result.duration.as_secs(),
             kind: result.kind,
             timestamp_unix: SystemTime::now()

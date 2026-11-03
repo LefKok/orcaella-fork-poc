@@ -20,7 +20,7 @@ use dag::{
     },
     crypto::CryptoEngine,
     metrics::Metrics,
-    storage::Storage,
+    storage::{BlockReader, Storage},
     sync::{net_sync::NetworkSyncer, network::Network},
 };
 use eyre::{Context, Result, eyre};
@@ -120,7 +120,8 @@ impl Replica {
             .unwrap_or_else(|| protocol.default_round_timeout());
         let enable_synchronizer = parameters.dag.enable_synchronizer;
         let fsync = parameters.dag.fsync;
-        let committer = Committer::new(committee.clone(), storage.block_reader().clone(), protocol);
+        let block_reader = storage.block_reader().clone();
+        let committer = Committer::new(committee.clone(), block_reader.clone(), protocol);
         let core = Core::open(
             block_handler,
             authority,
@@ -148,6 +149,7 @@ impl Replica {
             network_synchronizer,
             metrics,
             transaction_client: TransactionClient::new(transaction_sender),
+            block_reader,
         })
     }
 }
@@ -199,11 +201,18 @@ pub struct ReplicaHandle<C: Ctx> {
     metrics: Arc<Metrics>,
     /// Client over the channel for submitting transactions to the block handler.
     transaction_client: TransactionClient,
+    /// Read-only view of the replica's block store.
+    block_reader: BlockReader,
 }
 
 impl<C: Ctx> ReplicaHandle<C> {
     pub fn authority(&self) -> Authority {
         self.authority
+    }
+
+    /// A read-only handle on the replica's live block store.
+    pub fn block_reader(&self) -> BlockReader {
+        self.block_reader.clone()
     }
 
     /// Shut down the replica and return the inner `Syncer` for inspection (commit history,

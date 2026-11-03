@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use consensus::committer::Committer;
+use consensus::{committer::Committer, protocol::ConsensusProtocol};
 use dag::{
     authority::Authority,
     config::{ConfigError, ImportExport},
@@ -34,6 +34,7 @@ use crate::{
     executor::{JoinHandle, SimulatorExecutor},
     latency::LatencyModel,
     network::SimulatedNetwork,
+    recovery::{Recovery, RecoveryParams},
     tracing::SimulatorTracing,
 };
 
@@ -100,6 +101,8 @@ struct SimulationState {
     /// JoinHandles for any load generators we started, so they stay alive for the duration
     /// of the simulation.
     _load_generators: Vec<JoinHandle<()>>,
+    /// The fork recovery, when the fork attack asks for one.
+    recovery: Option<Recovery>,
 }
 
 impl SimulatedNetwork {
@@ -195,7 +198,19 @@ impl SimulationState {
             .consensus
             .to_protocol(&public_config.committee())
             .expect("invalid consensus protocol");
-        let commit_consumers = vec![None; config.committee_size];
+        let recovery_config = config
+            .fork_attack
+            .as_ref()
+            .and_then(|attack| attack.recovery.clone());
+        let (commit_consumers, commit_receivers): (Vec<_>, Vec<_>) = (0..config.committee_size)
+            .map(|_| match recovery_config {
+                Some(_) => {
+                    let (sender, receiver) = mpsc::channel(1 << 12);
+                    (Some(sender), Some(receiver))
+                }
+                None => (None, None),
+            })
+            .unzip();
         let (network, replicas, load_generators, metrics) = Self::build_replicas(
             public_config,
             config.latency.clone(),
@@ -217,12 +232,40 @@ impl SimulationState {
             tracing::info!("Fork attack configured: attack round R = {}", r);
         }
 
+        let recovery = match (
+            &config.fork_attack,
+            recovery_config,
+            network.fork_attack_round(),
+        ) {
+            (Some(attack), Some(recovery), Some(attack_round)) => {
+                let ConsensusProtocol::Orcaella { f, c, .. } = config.replica_parameters.consensus
+                else {
+                    panic!("fork recovery requires the Orcaella protocol");
+                };
+                let params = RecoveryParams::new(
+                    attack,
+                    config.committee_size,
+                    f as usize,
+                    c as usize,
+                    protocol.quorum_threshold as usize,
+                    protocol.anchor_link_size as usize,
+                    attack_round,
+                    recovery.delta_sync(),
+                );
+                let readers = replicas.iter().map(ReplicaHandle::block_reader).collect();
+                let receivers = commit_receivers.into_iter().flatten().collect();
+                Some(Recovery::start(params, &network, readers, receivers))
+            }
+            _ => None,
+        };
+
         Self {
             config,
             network,
             replicas,
             metrics,
             _load_generators: load_generators,
+            recovery,
         }
     }
 
@@ -294,8 +337,12 @@ impl SimulationState {
 
     async fn collect_result(self) -> io::Result<RunResult<SimulationConfig>> {
         let Self {
-            config, replicas, ..
+            config,
+            replicas,
+            recovery,
+            ..
         } = self;
+        let recovery = recovery.as_ref().map(Recovery::report);
         let duration = config.duration();
         let syncers: Vec<Syncer<SimulatorContext, Committer>> =
             futures::future::join_all(replicas.into_iter().map(ReplicaHandle::shutdown)).await;
@@ -305,12 +352,9 @@ impl SimulationState {
             .collect();
         let storages: Vec<Storage> = syncers.into_iter().map(Syncer::into_storage).collect();
 
-        Ok(RunResult::new(
-            metrics,
-            storages,
-            config,
-            duration,
-            RunKind::Simulation,
-        ))
+        Ok(
+            RunResult::new(metrics, storages, config, duration, RunKind::Simulation)
+                .with_recovery(recovery),
+        )
     }
 }

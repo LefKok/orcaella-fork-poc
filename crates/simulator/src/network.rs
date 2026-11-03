@@ -98,6 +98,12 @@ impl SimulatedNetwork {
         self.fork_attacker.as_ref().map(|a| a.attack_round())
     }
 
+    /// The `from -> to` link latency, jitter included, for traffic outside the replicas'
+    /// connections (the recovery exchange).
+    pub(crate) fn link(&self, from: usize, to: usize) -> LinkLatency {
+        self.latency.link(from, to).with_jitter(self.jitter)
+    }
+
     pub async fn connect_all(&self) {
         for a in 0..self.senders.len() {
             for b in a + 1..self.senders.len() {
@@ -183,7 +189,7 @@ impl SimulatedNetwork {
 
     /// A FIFO link that delays every message by its own latency, independently of those in
     /// flight.
-    fn latency_channel<T: Send + 'static + Debug>(
+    pub(crate) fn latency_channel<T: Send + 'static + Debug>(
         link: LinkLatency,
     ) -> (mpsc::Sender<T>, mpsc::Receiver<T>) {
         let (buf_sender, mut buf_receiver) = mpsc::channel(16);

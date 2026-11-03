@@ -178,7 +178,10 @@ honest replicas (D), A-side supporters (A'), and B-side supporters (B), then sel
 delivers twin blocks and rewrites vote references to cause D to direct-commit one twin while
 others indirect-commit the other.
 
-The `fork_attack` and `equivocating_leaders` fields are mutually exclusive.
+The `fork_attack` and `equivocating_leaders` fields are mutually exclusive. With
+`fork_attack.recovery` set, the run also executes the paper's fork recovery (detection, Alarm,
+`2Δ_sync` wait, Dolev-Strong exchange, counting, GenesisQC) and reports it under `recovery` in
+`meta.yaml`; see the "Recovery" section of the same document.
 
 ## Outcomes
 

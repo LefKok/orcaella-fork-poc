@@ -175,6 +175,38 @@ pub struct ForkAttack {
     /// Delay (ms) for messages from D to non-D peers.
     #[serde(default = "fork_attack_defaults::hide_delay_ms")]
     pub hide_delay_ms: u64,
+    /// Gap (ms) between the two twins an equivocator sends to one peer. Suspended blocks are
+    /// released in hash order, so under uneven latencies (a far region receives L's twins
+    /// before their parents) the first-delivered twin is not always processed first; a gap
+    /// of about the maximum link latency restores the order the attack needs.
+    #[serde(default)]
+    pub twin_gap_ms: u64,
+    /// Equivocators (the last `unexposed` indices) that do not double-block: they vote for
+    /// twin B like honest B-side replicas and expose nothing, but in recovery attest the
+    /// conflicting root (see docs/fork-attack-poc.md, "Recovery").
+    #[serde(default)]
+    pub unexposed: usize,
+    /// Honest non-hidden replicas (the last `crashed` indices of `A' ∪ B`) that crash when
+    /// they receive the Alarm and take no part in recovery.
+    #[serde(default)]
+    pub crashed: usize,
+    /// Run the fork recovery (paper, Algorithm 2) once the fork is detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryConfig>,
+}
+
+/// Fork recovery parameters (see docs/fork-attack-poc.md, "Recovery").
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RecoveryConfig {
+    /// The synchronous bound Δ_sync (ms): the lockstep round length of the exchange.
+    #[serde(default = "fork_attack_defaults::delta_sync_ms")]
+    pub delta_sync_ms: u64,
+}
+
+impl RecoveryConfig {
+    pub fn delta_sync(&self) -> Duration {
+        Duration::from_millis(self.delta_sync_ms)
+    }
 }
 
 mod fork_attack_defaults {
@@ -183,6 +215,9 @@ mod fork_attack_defaults {
     }
     pub fn hide_delay_ms() -> u64 {
         5000
+    }
+    pub fn delta_sync_ms() -> u64 {
+        200
     }
 }
 
@@ -196,12 +231,34 @@ impl ForkAttack {
         if total > n {
             return Err(ForkAttackError::SetsTooLarge { total, n });
         }
+        if self.unexposed >= self.equivocators {
+            return Err(ForkAttackError::TooManyUnexposed {
+                unexposed: self.unexposed,
+                equivocators: self.equivocators,
+            });
+        }
+        if self.crashed > self.a_prime_indices(n).len() + self.b_side {
+            return Err(ForkAttackError::TooManyCrashed {
+                crashed: self.crashed,
+            });
+        }
         Ok(())
     }
 
     /// Equivocator indices: L = 0 and the last `equivocators - 1` indices.
     pub fn equivocator_indices(&self, n: usize) -> impl Iterator<Item = usize> {
         std::iter::once(0).chain(n + 1 - self.equivocators..n)
+    }
+
+    /// Equivocators that double-block in the attack: all but the last `unexposed`.
+    pub fn exposing_indices(&self, n: usize) -> impl Iterator<Item = usize> {
+        std::iter::once(0).chain(n + 1 - self.equivocators..n - self.unexposed)
+    }
+
+    /// Honest replicas that crash at the Alarm: the last `crashed` indices of `A' ∪ B`.
+    pub fn crashed_indices(&self, n: usize) -> Range<usize> {
+        let end = self.hidden_indices(n).start;
+        end - self.crashed..end
     }
 
     /// Hidden (D) indices: just before the trailing equivocators.
@@ -225,6 +282,11 @@ impl ForkAttack {
     pub fn hide_delay(&self) -> Duration {
         Duration::from_millis(self.hide_delay_ms)
     }
+
+    /// Twin gap as a Duration.
+    pub fn twin_gap(&self) -> Duration {
+        Duration::from_millis(self.twin_gap_ms)
+    }
 }
 
 /// Errors from fork attack validation.
@@ -236,6 +298,13 @@ pub enum ForkAttackError {
     SetsTooLarge { total: usize, n: usize },
     #[error("fork_attack is mutually exclusive with equivocating_leaders")]
     MutuallyExclusiveWithEquivocatingLeaders,
+    #[error("fork_attack has {unexposed} unexposed of {equivocators} equivocators")]
+    TooManyUnexposed {
+        unexposed: usize,
+        equivocators: usize,
+    },
+    #[error("fork_attack crashes {crashed} replicas, more than A' ∪ B holds")]
+    TooManyCrashed { crashed: usize },
 }
 
 impl SimulationConfig {

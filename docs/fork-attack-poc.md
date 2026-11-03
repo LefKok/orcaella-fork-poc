@@ -98,9 +98,17 @@ before R nothing is delayed or rewritten, and after R the others decide without 
 fork_attack:
   equivocators: 3        # e; L = 0 plus the last e-1 indices
   hidden: 3              # |D| = f + c
-  b_side: 3              # |B| = n - q = f + c ; A' is whatever remains up to q
+  b_side: 3              # |B| = n - q - unexposed ; A' is whatever remains up to q
   attack_start_round: 10
   hide_delay_ms: 5000
+  twin_gap_ms: 0         # delay of the second twin (and of equivocators' second R+1 vote); set
+                         # to about the maximum one-way latency under the geographic model so
+                         # that both twins do not wait for the same slow parents and get
+                         # released from the suspended set in hash order
+  unexposed: 0           # trailing equivocators that vote like B and expose nothing (recovery)
+  crashed: 0             # honest A' ∪ B replicas that crash at the Alarm (recovery)
+  recovery:              # optional: run Algorithm 2 (see "Recovery")
+    delta_sync_ms: 200
 ```
 
 Validate on load: `equivocators + hidden + a_prime + b_side == n`, `b_side == hidden`,
@@ -129,9 +137,71 @@ and print it with the outcome. Needs `q` and the equivocator index set, passed f
 `f c n e | outcome | resilient`. Expected: Diverged exactly for `e ≥ f+1`; resilient unique
 throughout this range. Run `e = n-2f-2c` once and report the panic as the resilient-path break.
 
+## Recovery
+
+`fork_attack.recovery: {delta_sync_ms}` runs the paper's fork recovery (Algorithm 2, "Fork
+Detection and Repair") on top of the attack, in `crates/simulator/src/recovery.rs`. The replica
+code is untouched: the recovery reads each replica's live block store (`ReplicaHandle::
+block_reader`) and commit stream, and exchanges its messages over links with the run's latency
+model.
+
+1. **Detection.** Every 50 ms a correct replica looks at slot `(L, R)` in its own DAG for a
+   VoteQC for one twin (`q` round-`(R+1)` blocks supporting it) together with a committed anchor
+   at a round `>= R+2` whose causal history links `k` round-`(R+1)` blocks supporting the other
+   twin (the DAG form of a NewView pinning the other digest). This never fires at `e <= f`
+   (`f+c+e < k`). `D` fires first, when the anchor commits, about `1.6 s` into the run.
+2. **Alarm and halt.** The detector broadcasts `Alarm` stamped with its clock and halts; a replica
+   receiving a valid `Alarm` (not from the future, at most `2Δ_sync` old) halts and re-broadcasts
+   it. The lockstep rounds are anchored at the earliest valid `Alarm` timestamp `T`, so correct
+   replicas, with clocks synchronized to within the slack in `Δ_sync`, share one round grid.
+   Crashed replicas (`fork_attack.crashed`, the last indices of `A' ∪ B`) stop here.
+3. **Input, fixed at `T + 2Δ_sync`.** The signed headers of rounds `R..=R+2` the replica holds
+   (twins, votes, anchors) and its ChkProps, one per height from the height below the attacked
+   slot to its last commit before the end of the wait (the wait lets a replica finish processing
+   the blocks already sent to it). ChkProps are emulated as in the Resilient Path
+   emulation (prefix hash as state root) and carry the previous root, which is how "extends the
+   canonical branch" is checked. Byzantine replicas attest the roots of `D`'s branch (the one the
+   client did not finalize); the ChkProps they gave the client for the finalized root are not in
+   the exchange, as in the proof of the counting lemma.
+4. **Dolev-Strong exchange**, `n` parallel instances, `t+1 = n-2f-c` rounds of `Δ_sync`: round 1
+   sends the own input; in round `r` a replica relays every value it newly extracted in round
+   `r-1` with the chain extended by its own signature; chains must have exactly `r` distinct
+   signers starting with the instance's sender; at most two values per instance are kept; after
+   round `t+1` an instance delivers if exactly one value was extracted. Relays carry the full
+   value, as in the 1983 protocol. Signatures are simulated; bytes are accounted as 64 per
+   signature, `48 + 48·|parents| + 8 + 64` per header, `136` per ChkProp.
+5. **Exposure and counting.** `E` = authors with two blocks in one round or two ChkProps at one
+   height among the delivered inputs. `C_max` = highest height where one root has `q` delivered
+   ChkProps. Above it, height by height, the root with the unique maximum of ChkProps from
+   signers outside `E` is adopted if it extends the branch; otherwise the step stops and the slot
+   is extended with the lowest-digest delivered VoteQC (the twin with `q` delivered supports).
+6. **GenesisQC.** Each replica signs the digest of its canonical branch; `q` matching signatures
+   form the GenesisQC.
+
+Worst-case layout (`fork_attack.unexposed = e-f-1`, `crashed = c`, `b_side = f+c-unexposed`):
+the last `unexposed` equivocators vote for twin B like honest B-side replicas and expose nothing,
+so `E` holds exactly the `f+1` double-blockers, and `c` honest signers of the finalized root
+crash at the Alarm. The counts at the fork height are then `q-e-c` for the finalized root against
+`f+c+(e-f-1) = e+c-1` for `D`'s root: a strict majority for `e <= 2f` and a tie at `e = 2f+1`,
+where the counting step stops and the VoteQC fallback picks `D`'s twin. In the plain layout every
+equivocator is exposed and the count is `q-e` against `f+c`. Above the minimal committee size the
+indirect rule needs `k = n-3f-2c` links, so the attack exposes at least `q+k-n` equivocators and
+the worst case is `unexposed = e-(q+k-n)`, `b_side = n-q-unexposed` (at `n = 51`, `f = c = 6`:
+`q+k-n = 9`, counts `q-e-c` against `f+c+e-9`, tie at `e = 15`).
+
+The report (`meta.yaml: recovery`, also printed) carries the detection and Alarm times, the
+exchange window, the earliest and latest correct GenesisQC, `recovery_ms` (Alarm to last
+GenesisQC), `|E|`, the two counts at the fork height, whether the finalized root was recovered,
+whether all correct replicas agree on the branch, and the bytes of one input and of one replica's
+total traffic. `scripts/fork_attack/sweep.py --recovery [Δ_sync_ms] [--worst-case]` sweeps it.
+
+Approximations: the replicas' normal-operation tasks keep running in the background (the halt is
+modelled by the fixed inputs); the input headers are rounds `R..=R+2` rather than everything since
+the last checkpoint; bandwidth is not modelled, so bytes do not affect timing.
+
 ## Non-goals
 
-No fork detection, no Alarm, no recovery, no real checkpoint messages, no stake weighting, no
-production hardening. Minimise lines; prefer one new file `crates/simulator/src/fork_attack.rs`
-plus small edits to `network.rs`, `config.rs`, `runner.rs`, `result.rs`, the simulate command,
-and a test in `crates/simulator/tests/fork_attack.rs`.
+No real checkpoint messages, no stake weighting, no production hardening. Minimise lines; the
+attack is one file `crates/simulator/src/fork_attack.rs` plus small edits to `network.rs`,
+`config.rs`, `runner.rs`, `result.rs`, the simulate command, and a test in
+`crates/simulator/tests/fork_attack.rs`; the recovery is `crates/simulator/src/recovery.rs`.

@@ -100,7 +100,9 @@ pub async fn simulate(
                 .to_protocol(&committee)
                 .expect("valid protocol")
                 .quorum_threshold as usize;
-            let equivocators: Vec<usize> = attack.equivocator_indices(result.config.committee_size).collect();
+            let equivocators: Vec<usize> = attack
+                .equivocator_indices(result.config.committee_size)
+                .collect();
             let outcome = ResilientOutcome::compute(
                 result.storages.iter().map(|s| s.iter_commits()),
                 quorum,
@@ -121,6 +123,46 @@ pub async fn simulate(
             );
             outcome
         });
+
+        if let Some(recovery) = &result.recovery {
+            let opt = |value: Option<u64>| value.map_or("none".to_string(), |v| v.to_string());
+            terminal.print_details(
+                "Fork recovery",
+                &[
+                    ("delta_sync_ms", &recovery.delta_sync_ms.to_string()),
+                    ("rounds", &recovery.rounds.to_string()),
+                    ("detection_ms", &opt(recovery.detection_ms)),
+                    ("alarm_ms", &opt(recovery.alarm_ms)),
+                    ("genesis_last_ms", &opt(recovery.genesis_last_ms)),
+                    ("recovery_ms", &opt(recovery.recovery_ms)),
+                    ("fork_height", &opt(recovery.fork_height.map(|h| h as u64))),
+                    ("c_max", &recovery.c_max.to_string()),
+                    ("exposed", &recovery.exposed.to_string()),
+                    (
+                        "exposed_only_byzantine",
+                        &recovery.exposed_only_byzantine.to_string(),
+                    ),
+                    ("count_finalized", &recovery.count_finalized.to_string()),
+                    ("count_conflicting", &recovery.count_conflicting.to_string()),
+                    (
+                        "finalized_recovered",
+                        &recovery
+                            .finalized_recovered
+                            .map_or("none".to_string(), |v| v.to_string()),
+                    ),
+                    (
+                        "break_height",
+                        &opt(recovery.break_height.map(|h| h as u64)),
+                    ),
+                    ("agreement", &recovery.agreement.to_string()),
+                    ("canonical_height", &recovery.canonical_height.to_string()),
+                    ("input_bytes_max", &recovery.input_bytes_max.to_string()),
+                    ("sent_bytes_max", &recovery.sent_bytes_max.to_string()),
+                    ("sent_bytes_total", &recovery.sent_bytes_total.to_string()),
+                    ("messages_total", &recovery.messages_total.to_string()),
+                ],
+            );
+        }
 
         if result.outcome == Outcome::Diverged {
             diverged += 1;

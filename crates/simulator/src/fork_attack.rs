@@ -32,10 +32,24 @@ use crate::executor::Sleep;
 pub(crate) struct ForkAttacker {
     n: usize,
     equivocators: usize,
+    unexposed: usize,
     hidden: Range<usize>,
     a_prime: Range<usize>,
     attack_round: RoundNumber,
     hide_delay: Duration,
+    twin_gap: Duration,
+}
+
+/// When the shim delivers a rewritten message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Delay {
+    /// Now.
+    None,
+    /// After `twin_gap`: the second twin of a pair, so the first is processed first even when
+    /// both are held back for a missing parent (suspended blocks are released in hash order).
+    Gap,
+    /// After `hide_delay`: once slot R is decided.
+    Hide,
 }
 
 impl ForkAttacker {
@@ -50,10 +64,12 @@ impl ForkAttacker {
         Self {
             n,
             equivocators: config.equivocators,
+            unexposed: config.unexposed,
             a_prime: config.a_prime_indices(n),
             hidden,
             attack_round,
             hide_delay: config.hide_delay(),
+            twin_gap: config.twin_gap(),
         }
     }
 
@@ -62,8 +78,10 @@ impl ForkAttacker {
         self.attack_round
     }
 
+    /// Whether `index` double-blocks in the attack: L, or a trailing equivocator that is not
+    /// among the last `unexposed` (those vote like honest B-side replicas).
     pub(crate) fn is_equivocator(&self, index: usize) -> bool {
-        index == 0 || index >= self.n + 1 - self.equivocators
+        index == 0 || (index >= self.n + 1 - self.equivocators && index < self.n - self.unexposed)
     }
 
     fn is_hidden(&self, index: usize) -> bool {
@@ -131,27 +149,26 @@ impl ForkAttacker {
             })
     }
 
-    /// Rewrite an outgoing message from an equivocator on the `sender -> receiver` link.
-    /// Returns the messages to deliver now and, optionally, one to deliver after `hide_delay`.
+    /// Rewrite an outgoing message from an equivocator on the `sender -> receiver` link into
+    /// the messages to deliver and when.
     pub(crate) fn rewrite(
         &self,
         message: NetworkMessage,
         sender: usize,
         receiver: usize,
-    ) -> (Vec<NetworkMessage>, Option<Data<Block>>) {
+    ) -> Vec<(NetworkMessage, Delay)> {
         let NetworkMessage::Block(block) = &message else {
-            return (vec![message], None);
+            return vec![(message, Delay::None)];
         };
         // L's round-R block: every peer gets both twins, so nobody waits on a missing parent;
         // the first-delivered twin is the one the peer's vote supports. D ∪ A' get twin A
         // first, everyone else the native block (twin B) first.
         if let Some(twin_a) = self.leader_twin_a(&message, sender) {
-            let both = if self.a_prime.contains(&receiver) || self.is_hidden(receiver) {
-                vec![twin_a, message]
+            return if self.a_prime.contains(&receiver) || self.is_hidden(receiver) {
+                vec![(twin_a, Delay::None), (message, Delay::Gap)]
             } else {
-                vec![message, twin_a]
+                vec![(message, Delay::None), (twin_a, Delay::Gap)]
             };
-            return (both, None);
         }
         // An equivocator's own round-(R+1) vote: D gets the twin-A version first, then the
         // native vote too, so D can still process the others' later blocks that reference it.
@@ -159,14 +176,14 @@ impl ForkAttacker {
         // `hide_delay`, once slot R is decided, so that D's later blocks (which reference the
         // twin-A versions) become processable and the DAG heals.
         if block.author() == Authority::from(sender) && block.round() == self.attack_round + 1 {
-            let twin_a_vote = self.to_twin_a_vote(block);
+            let twin_a_vote = NetworkMessage::Block(self.to_twin_a_vote(block));
             return if self.is_hidden(receiver) {
-                (vec![NetworkMessage::Block(twin_a_vote), message], None)
+                vec![(twin_a_vote, Delay::None), (message, Delay::Gap)]
             } else {
-                (vec![message], Some(twin_a_vote))
+                vec![(message, Delay::None), (twin_a_vote, Delay::Hide)]
             };
         }
-        (vec![message], None)
+        vec![(message, Delay::None)]
     }
 }
 
@@ -229,26 +246,37 @@ pub(crate) fn fork_attack_outbound(
         return sender;
     }
     let (tx, mut rx) = mpsc::channel(16);
-    let late = delayed(sender.clone(), attacker.hide_delay, 0..=RoundNumber::MAX);
+    let all = 0..=RoundNumber::MAX;
+    let late = delayed(sender.clone(), attacker.hide_delay, all.clone());
+    let gap = delayed(sender.clone(), attacker.twin_gap, all.clone());
     // The equivocator never sends to itself, so its own twin-A vote (referenced by D's later
     // blocks) is reflected into its own DAG through the first link, late like everyone else's.
-    let late_self = delayed(inbound.clone(), attacker.hide_delay, 0..=RoundNumber::MAX);
+    let late_self = delayed(inbound.clone(), attacker.hide_delay, all);
     SimulatorContext::spawn(async move {
         while let Some(message) = rx.recv().await {
-            if to == 1 && let Some(twin_a) = attacker.leader_twin_a(&message, from) {
+            if to == 1
+                && let Some(twin_a) = attacker.leader_twin_a(&message, from)
+            {
                 inbound.try_send(twin_a).ok();
             }
-            let (now, later) = attacker.rewrite(message, from, to);
-            for message in now {
-                if sender.send(message).await.is_err() {
-                    return;
-                }
-            }
-            if let Some(block) = later {
-                if to == 1 && late_self.send(NetworkMessage::Block(block.clone())).await.is_err() {
-                    return;
-                }
-                if late.send(NetworkMessage::Block(block)).await.is_err() {
+            for (message, delay) in attacker.rewrite(message, from, to) {
+                let channel = match delay {
+                    Delay::None => &sender,
+                    Delay::Gap => &gap,
+                    Delay::Hide => {
+                        if to == 1
+                            && let NetworkMessage::Block(block) = &message
+                            && late_self
+                                .send(NetworkMessage::Block(block.clone()))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                        &late
+                    }
+                };
+                if channel.send(message).await.is_err() {
                     return;
                 }
             }
@@ -268,6 +296,10 @@ mod tests {
             b_side: 3,
             attack_start_round: 10,
             hide_delay_ms: 5000,
+            twin_gap_ms: 0,
+            unexposed: 0,
+            crashed: 0,
+            recovery: None,
         };
         ForkAttacker::new(&config, 14, LeaderElection::RoundRobin)
     }
